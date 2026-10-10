@@ -107,12 +107,13 @@ T ReadVectorOperand(const TRegisterFile& regs, const TVMOperand& operand, int of
     }
 }
 
-template<typename T, typename TOp>
+template<typename T, bool Boolean, bool Unary, typename TOp>
 void EvalVectorLanes(TRegisterFile& regs, const TVMInstr& instr, TOp op) {
     // Unsigned arithmetic gives modular integer lanes without signed overflow
     // or the overflowing int promotions of small integer multiplication.
     using TCalc = std::conditional_t<std::is_floating_point_v<T>, T, uint64_t>;
-    const int leftStride = (instr.Format & TVMInstr::BroadcastLeft)
+    using TResult = std::conditional_t<Boolean, uint8_t, T>;
+    const int leftStride = (!Unary && (instr.Format & TVMInstr::BroadcastLeft))
         ? 0
         : sizeof(T);
     const int rightStride = (instr.Format & TVMInstr::BroadcastRight)
@@ -120,28 +121,76 @@ void EvalVectorLanes(TRegisterFile& regs, const TVMInstr& instr, TOp op) {
         : sizeof(T);
     for (size_t i = 0; i < instr.LaneCount(); ++i) {
         const auto left = ReadVectorOperand<T>(regs, instr.Operands[1], static_cast<int>(i) * leftStride);
-        const auto right = ReadVectorOperand<T>(regs, instr.Operands[2], static_cast<int>(i) * rightStride);
-        regs.Get<T>(instr.Operands[0].Tmp.Idx + static_cast<int>(i * sizeof(T))) =
-            static_cast<T>(op(static_cast<TCalc>(left), static_cast<TCalc>(right)));
+        T right = 0;
+        if constexpr (!Unary) {
+            right = ReadVectorOperand<T>(regs, instr.Operands[2], static_cast<int>(i) * rightStride);
+        }
+        regs.Get<TResult>(instr.Operands[0].Tmp.Idx + static_cast<int>(i * sizeof(TResult))) =
+            static_cast<TResult>(op(static_cast<TCalc>(left), static_cast<TCalc>(right)));
     }
 }
 
-template<bool Floating, typename TOp>
-void EvalVectorAlu(TRegisterFile& regs, const TVMInstr& instr, TOp op) {
+template<bool Floating, bool Signed = false, typename TVisitor>
+void VisitVectorElement(size_t size, TVisitor visitor) {
     if constexpr (Floating) {
-        switch (instr.ElementSizeInBytes()) {
-            case 4: EvalVectorLanes<float>(regs, instr, op); return;
-            case 8: EvalVectorLanes<double>(regs, instr, op); return;
+        switch (size) {
+            case 4: visitor.template operator()<float>(); return;
+            case 8: visitor.template operator()<double>(); return;
         }
     } else {
-        switch (instr.ElementSizeInBytes()) {
-            case 1: EvalVectorLanes<uint8_t>(regs, instr, op); return;
-            case 2: EvalVectorLanes<uint16_t>(regs, instr, op); return;
-            case 4: EvalVectorLanes<uint32_t>(regs, instr, op); return;
-            case 8: EvalVectorLanes<uint64_t>(regs, instr, op); return;
+        switch (size) {
+            case 1: visitor.template operator()<std::conditional_t<Signed, int8_t, uint8_t>>(); return;
+            case 2: visitor.template operator()<std::conditional_t<Signed, int16_t, uint16_t>>(); return;
+            case 4: visitor.template operator()<std::conditional_t<Signed, int32_t, uint32_t>>(); return;
+            case 8: visitor.template operator()<std::conditional_t<Signed, int64_t, uint64_t>>(); return;
         }
     }
-    throw std::runtime_error("Unsupported vector arithmetic element width");
+    throw std::runtime_error("Unsupported vector element width");
+}
+
+template<bool Floating, bool Boolean = false, bool Unary = false, typename TOp>
+void EvalVectorAlu(TRegisterFile& regs, const TVMInstr& instr, TOp op) {
+    VisitVectorElement<Floating>(instr.ElementSizeInBytes(), [&]<typename T>() {
+        EvalVectorLanes<T, Boolean, Unary>(regs, instr, op);
+    });
+}
+
+int64_t SignedVectorLane(uint64_t value, size_t size) {
+    const int shift = static_cast<int>(64 - size * 8);
+    return std::bit_cast<int64_t>(value << shift) >> shift;
+}
+
+template<typename TOp>
+void EvalSignedVectorComparison(TRegisterFile& regs, const TVMInstr& instr, TOp op) {
+    EvalVectorAlu<false, true>(regs, instr, [&](uint64_t a, uint64_t b) {
+        return op(SignedVectorLane(a, instr.ElementSizeInBytes()), SignedVectorLane(b, instr.ElementSizeInBytes()));
+    });
+}
+
+template<typename TVisitor>
+void VisitVectorCastElement(size_t size, bool floating, bool signedInteger, TVisitor visitor) {
+    if (floating) {
+        VisitVectorElement<true>(size, visitor);
+    } else if (signedInteger) {
+        VisitVectorElement<false, true>(size, visitor);
+    } else {
+        VisitVectorElement<false>(size, visitor);
+    }
+}
+
+void EvalVectorCast(TRegisterFile& regs, const TVMInstr& instr) {
+    const bool sourceFloat = instr.Op == EVMOp::VF2I || instr.Op == EVMOp::VFCast;
+    const bool resultFloat = instr.Op == EVMOp::VI2F || instr.Op == EVMOp::VFCast;
+    VisitVectorCastElement(instr.ElementSizeInBytes(), sourceFloat, instr.Format & TVMInstr::SignedElement,
+        [&]<typename TSource>() {
+            VisitVectorCastElement(instr.Operands[2].Imm.Value, resultFloat, instr.Format & TVMInstr::SignedResult,
+                [&]<typename TResult>() {
+                    for (size_t i = 0; i < instr.LaneCount(); ++i) {
+                        const auto value = ReadVectorOperand<TSource>(regs, instr.Operands[1], static_cast<int>(i * sizeof(TSource)));
+                        regs.Get<TResult>(instr.Operands[0].Tmp.Idx + static_cast<int>(i * sizeof(TResult))) = static_cast<TResult>(value);
+                    }
+                });
+        });
 }
 
 uint64_t EvalVectorIndex(const TRegisterFile& regs, const TVMInstr& instr) {
@@ -152,16 +201,11 @@ uint64_t EvalVectorIndex(const TRegisterFile& regs, const TVMInstr& instr) {
     const size_t size = instr.ElementSizeInBytes();
     const int offset = static_cast<int>(index * size);
     uint64_t value;
-    switch (size) {
-        case 1: value = ReadVectorOperand<uint8_t>(regs, instr.Operands[1], offset); break;
-        case 2: value = ReadVectorOperand<uint16_t>(regs, instr.Operands[1], offset); break;
-        case 4: value = ReadVectorOperand<uint32_t>(regs, instr.Operands[1], offset); break;
-        case 8: value = ReadVectorOperand<uint64_t>(regs, instr.Operands[1], offset); break;
-        default: throw std::runtime_error("Unsupported vector element width");
-    }
+    VisitVectorElement<false>(size, [&]<typename T>() {
+        value = ReadVectorOperand<T>(regs, instr.Operands[1], offset);
+    });
     if ((instr.Format & TVMInstr::SignedElement) && size < 8) {
-        const int shift = static_cast<int>(64 - size * 8);
-        value = std::bit_cast<uint64_t>(std::bit_cast<int64_t>(value << shift) >> shift);
+        value = std::bit_cast<uint64_t>(SignedVectorLane(value, size));
     }
     return value;
 }
@@ -472,6 +516,43 @@ TFuture<std::optional<int64_t>> TInterpreter::DoEvalRawAsync(TFunction& function
         case EVMOp::VIndex:
             Runtime.Regs.Get<uint64_t>(instr.Operands[0].Tmp.Idx) = EvalVectorIndex(Runtime.Regs, instr);
             break;
+        case EVMOp::VAll:
+        case EVMOp::VAny: {
+            const bool all = instr.Op == EVMOp::VAll;
+            bool result = all;
+            for (size_t i = 0; i < instr.LaneCount(); ++i) {
+                const bool lane = ReadVectorOperand<uint8_t>(Runtime.Regs, instr.Operands[1], static_cast<int>(i)) != 0;
+                if (lane != all) {
+                    result = lane;
+                    break;
+                }
+            }
+            Runtime.Regs.Get<uint64_t>(instr.Operands[0].Tmp.Idx) = result;
+            break;
+        }
+        case EVMOp::VShuffle: {
+            if (instr.Operands[1].Type == TVMOperand::EType::Imm) {
+                assert(instr.Operands[1].Imm.Value == 0);
+                std::memset(Runtime.Regs.Data() + instr.Operands[0].Tmp.Idx, 0, instr.SizeInBytes());
+                break;
+            }
+            const auto* mask = reinterpret_cast<const int*>(instr.Operands[2].Imm.Value);
+            std::array<uint8_t, 256> result;
+            const auto size = instr.ElementSizeInBytes();
+            const auto* source = Runtime.Regs.Data() + instr.Operands[1].Tmp.Idx;
+            for (size_t i = 0; i < instr.LaneCount(); ++i) {
+                assert(mask[i] >= 0 && static_cast<size_t>(mask[i]) < instr.LaneCount());
+                std::memcpy(result.data() + i * size, source + mask[i] * size, size);
+            }
+            std::memcpy(Runtime.Regs.Data() + instr.Operands[0].Tmp.Idx, result.data(), instr.SizeInBytes());
+            break;
+        }
+        case EVMOp::VICast:
+        case EVMOp::VI2F:
+        case EVMOp::VF2I:
+        case EVMOp::VFCast:
+            EvalVectorCast(Runtime.Regs, instr);
+            break;
         case EVMOp::VIAdd:
             EvalVectorAlu<false>(Runtime.Regs, instr, std::plus<>{});
             break;
@@ -489,6 +570,94 @@ TFuture<std::optional<int64_t>> TInterpreter::DoEvalRawAsync(TFunction& function
             break;
         case EVMOp::VFMul:
             EvalVectorAlu<true>(Runtime.Regs, instr, std::multiplies<>{});
+            break;
+
+        case EVMOp::VIAnd:
+            EvalVectorAlu<false>(Runtime.Regs, instr, std::bit_and<>{});
+            break;
+        case EVMOp::VIOr:
+            EvalVectorAlu<false>(Runtime.Regs, instr, std::bit_or<>{});
+            break;
+        case EVMOp::VIXor:
+            EvalVectorAlu<false>(Runtime.Regs, instr, std::bit_xor<>{});
+            break;
+        case EVMOp::VIShl:
+            EvalVectorAlu<false>(Runtime.Regs, instr, [&](uint64_t a, uint64_t b) {
+                return a << (b & (instr.ElementSizeInBytes() * 8 - 1));
+            });
+            break;
+        case EVMOp::VIShrU:
+            EvalVectorAlu<false>(Runtime.Regs, instr, [&](uint64_t a, uint64_t b) {
+                return a >> (b & (instr.ElementSizeInBytes() * 8 - 1));
+            });
+            break;
+        case EVMOp::VIShrS:
+            EvalVectorAlu<false>(Runtime.Regs, instr, [&](uint64_t a, uint64_t b) {
+                return SignedVectorLane(a, instr.ElementSizeInBytes()) >> (b & (instr.ElementSizeInBytes() * 8 - 1));
+            });
+            break;
+        case EVMOp::VIBitNot:
+            EvalVectorAlu<false, false, true>(Runtime.Regs, instr, [](uint64_t a, uint64_t) { return ~a; });
+            break;
+        case EVMOp::VINot:
+        case EVMOp::VI2B:
+            EvalVectorAlu<false, true, true>(Runtime.Regs, instr, [&](uint64_t a, uint64_t) {
+                return (a != 0) != (instr.Op == EVMOp::VINot);
+            });
+            break;
+        case EVMOp::VFNot:
+        case EVMOp::VF2B:
+            EvalVectorAlu<true, true, true>(Runtime.Regs, instr, [&](auto a, auto) {
+                return (a != 0) != (instr.Op == EVMOp::VFNot);
+            });
+            break;
+        case EVMOp::VICmpLTU:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::less<>{});
+            break;
+        case EVMOp::VICmpLTS:
+            EvalSignedVectorComparison(Runtime.Regs, instr, std::less<>{});
+            break;
+        case EVMOp::VICmpGTU:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::greater<>{});
+            break;
+        case EVMOp::VICmpGTS:
+            EvalSignedVectorComparison(Runtime.Regs, instr, std::greater<>{});
+            break;
+        case EVMOp::VICmpLEU:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::less_equal<>{});
+            break;
+        case EVMOp::VICmpLES:
+            EvalSignedVectorComparison(Runtime.Regs, instr, std::less_equal<>{});
+            break;
+        case EVMOp::VICmpGEU:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::greater_equal<>{});
+            break;
+        case EVMOp::VICmpGES:
+            EvalSignedVectorComparison(Runtime.Regs, instr, std::greater_equal<>{});
+            break;
+        case EVMOp::VICmpEQ:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::equal_to<>{});
+            break;
+        case EVMOp::VICmpNE:
+            EvalVectorAlu<false, true>(Runtime.Regs, instr, std::not_equal_to<>{});
+            break;
+        case EVMOp::VFCmpLT:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::less<>{});
+            break;
+        case EVMOp::VFCmpGT:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::greater<>{});
+            break;
+        case EVMOp::VFCmpLE:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::less_equal<>{});
+            break;
+        case EVMOp::VFCmpGE:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::greater_equal<>{});
+            break;
+        case EVMOp::VFCmpEQ:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::equal_to<>{});
+            break;
+        case EVMOp::VFCmpNE:
+            EvalVectorAlu<true, true>(Runtime.Regs, instr, std::not_equal_to<>{});
             break;
 
         case EVMOp::INeg:

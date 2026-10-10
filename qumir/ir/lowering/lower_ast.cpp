@@ -1,4 +1,5 @@
 #include "lower_ast.h"
+#include <qumir/semantics/vector_intrinsics.h>
 #include "qumir/ir/builder.h"
 #include "qumir/parser/parser.h"
 #include "qumir/parser/core/printer.h"
@@ -782,6 +783,30 @@ TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::Lowe
     co_return TValueWithBlock{result, Builder.CurrentBlockLabel()};
 }
 
+TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::LowerVectorIntrinsic(
+    const NAst::TCallExpr& call, std::string_view op, TBlockScope scope)
+{
+    auto value = co_await Lower(call.Args[0], scope);
+    if (!value.Value) {
+        co_return TError(call.Location, "Vector intrinsic argument must produce a value");
+    }
+    TInstrEmitter emitter{Builder, InstDebugInfo(call.Location, scope.Id.Id), DebugPoints_, Module.DebugOptions.EmitDebugInfo};
+    TTmp tmp;
+    if (op == "shuffle") {
+        std::vector<int> mask;
+        for (const auto& element : NAst::TMaybeNode<NAst::TVectorExpr>(call.Args[1]).Cast()->Elements) {
+            mask.push_back(static_cast<int>(NAst::TMaybeNode<NAst::TNumberExpr>(element).Cast()->IntValue));
+        }
+        const auto id = static_cast<int64_t>(Module.VectorShuffleMasks.size());
+        Module.VectorShuffleMasks.push_back(std::move(mask));
+        tmp = emitter.Emit1("shuffle"_op, {*value.Value, TImm{id, Module.Types.I(EKind::I64)}});
+    } else {
+        tmp = emitter.Emit1(op == "all" ? "all"_op : "any"_op, {*value.Value});
+    }
+    Builder.SetType(tmp, FromAstType(call.Type, Module.Types));
+    co_return TValueWithBlock{tmp, Builder.CurrentBlockLabel()};
+}
+
 TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::Lower(const NAst::TExprPtr& inputExpr, TBlockScope scope) {
     NAst::TExprPtr expr = inputExpr;
     TInstrEmitter emitter{Builder, InstDebugInfo(expr->Location, scope.Id.Id), DebugPoints_, Module.DebugOptions.EmitDebugInfo};
@@ -949,6 +974,22 @@ TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::Lowe
         auto cast = maybeCast.Cast();
         auto operand = co_await Lower(cast->Operand, scope);
         if (!operand.Value) co_return TError(cast->Operand->Location, TErrorString::Get<EErrorId::OPERAND_OF_CAST_NOT_VALUE>());
+        auto sourceVector = NAst::TMaybeType<NAst::TVectorType>(
+            NAst::UnwrapNamedType(NAst::UnwrapReferenceType(cast->Operand->Type))).Cast();
+        auto targetVector = NAst::TMaybeType<NAst::TVectorType>(NAst::UnwrapNamedType(expr->Type)).Cast();
+        if (sourceVector && targetVector) {
+            const int sourceType = FromAstType(sourceVector->ElementType, Module.Types);
+            const int targetType = FromAstType(targetVector->ElementType, Module.Types);
+            TOp op = "mov"_op;
+            if (Module.Types.GetKind(targetType) == EKind::I1) {
+                op = Module.Types.IsFloat(sourceType) ? "f2b"_op : "i2b"_op;
+            } else if (Module.Types.IsFloat(sourceType) != Module.Types.IsFloat(targetType)) {
+                op = Module.Types.IsFloat(sourceType) ? "f2i"_op : "i2f"_op;
+            }
+            auto tmp = emitter.Emit1(op, {*operand.Value});
+            Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
+            co_return TValueWithBlock{tmp, Builder.CurrentBlockLabel()};
+        }
         std::optional<TOperand> tmp;
         auto sourceArrayForPtrCast = NAst::TMaybeType<NAst::TArrayType>(
             NAst::UnwrapNamedType(cast->Operand->Type));
@@ -1059,104 +1100,62 @@ TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::Lowe
     } else if (auto maybeUnary = NAst::TMaybeNode<NAst::TUnaryExpr>(expr)) {
         auto unary = maybeUnary.Cast();
         auto operand = co_await Lower(unary->Operand, scope);
-        if (!operand.Value) co_return TError(unary->Operand->Location, TErrorString::Get<EErrorId::OPERAND_OF_UNARY_NOT_NUMBER>());
-        if (unary->Operator == '-') {
-            auto tmp = emitter.Emit1("neg"_op, {*operand.Value});
-            Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
-            co_return TValueWithBlock{ tmp, Builder.CurrentBlockLabel() };
-        } else if (unary->Operator == '!'_op) {
-            auto tmp = emitter.Emit1("!"_op, {*operand.Value});
-            Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
-            co_return TValueWithBlock{ tmp, Builder.CurrentBlockLabel() };
-        } else if (unary->Operator == '~'_op) {
-            auto tmp = emitter.Emit1("~"_op, {*operand.Value});
+        if (!operand.Value) {
+            co_return TError(unary->Operand->Location, TErrorString::Get<EErrorId::OPERAND_OF_UNARY_NOT_NUMBER>());
+        }
+        if (unary->Operator == '-' || unary->Operator == '!'_op || unary->Operator == '~'_op) {
+            auto op = unary->Operator == '-'
+                ? "neg"_op
+                : TOp(unary->Operator.Value);
+            auto tmp = emitter.Emit1(op, {*operand.Value});
             Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
             co_return TValueWithBlock{ tmp, Builder.CurrentBlockLabel() };
         }
         co_return TValueWithBlock{ operand.Value, operand.ProducingLabel };
     } else if (auto maybeBinary = NAst::TMaybeNode<NAst::TBinaryExpr>(expr)) {
         auto binary = maybeBinary.Cast();
-        if (NAst::TMaybeType<NAst::TVectorType>(NAst::UnwrapNamedType(expr->Type))
-            && (binary->Operator == "&&"_op || binary->Operator == "||"_op))
-        {
-            co_return TError(binary->Location, "vector logical operators are not supported in lowering yet");
-        }
-        bool isLazy = (binary->Operator == "&&"_op || binary->Operator == "||"_op);
+        const bool isVector = NAst::TMaybeType<NAst::TVectorType>(NAst::UnwrapNamedType(expr->Type));
+        const bool logical = binary->Operator == "&&"_op || binary->Operator == "||"_op;
+        const bool isLazy = !isVector && logical;
         auto leftRes = co_await Lower(binary->Left, scope);
-        auto leftNum = leftRes.Value;
+        if (!leftRes.Value) {
+            co_return TError(binary->Left->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
+        }
 
-        decltype(leftNum) rightNum;
-        decltype(leftRes) rightRes;
         if (!isLazy) {
-            rightRes = co_await Lower(binary->Right, scope);
-            rightNum = rightRes.Value;
-        }
-        if (!leftNum) co_return TError(binary->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
-        if (!isLazy && !rightNum) co_return TError(binary->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
-
-        switch ((uint64_t)binary->Operator) {
-            case "&&"_op: {
-                // Short-circuit AND using single end block + phi2 with real producing blocks.
-                // Evaluate left expression first (already done: leftNum) and capture its producing block.
-                auto leftProducingLabel = leftRes.ProducingLabel; // block where left value was produced
-
-                // Create blocks for RHS evaluation and the end/merge.
-                auto [rhsLabel, rhsId] = Builder.NewBlock();
-                auto endLabel = Builder.NewLabel();
-
-                // Emit branch on left: if true -> rhs; if false -> end.
-                Builder.SetCurrentBlock(leftProducingLabel);
-                emitter.Emit0("cmp"_op, {*leftNum, rhsLabel, endLabel});
-                auto leftEdgeLabel = Builder.CurrentBlockLabel(); // predecessor into end when left is false
-
-                // RHS path
-                Builder.SetCurrentBlock(rhsId);
-                auto r = co_await Lower(binary->Right, scope);
-                if (!r.Value) co_return TError(binary->Right->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
-                // Record truth of RHS (both edges go to end)
-                emitter.Emit0("jmp"_op, {endLabel});
-                auto rightEdgeLabel = Builder.CurrentBlockLabel(); // predecessor into end when left was true
-
-                // End/merge block and phi2 selecting left(on false) vs right(on true)
-                Builder.NewBlock(endLabel);
-                auto res = emitter.Emit1("phi"_op, {*leftNum, leftEdgeLabel, *r.Value, rightEdgeLabel});
-                Builder.SetType(res, FromAstType(expr->Type, Module.Types));
-                co_return TValueWithBlock{ res, Builder.CurrentBlockLabel() };
+            auto rightRes = co_await Lower(binary->Right, scope);
+            if (!rightRes.Value) {
+                co_return TError(binary->Right->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
             }
-            case "||"_op: {
-                // Short-circuit OR using single end block + phi2 with real producing blocks.
-                auto leftProducingLabel = leftRes.ProducingLabel;
-                auto [rhsLabel, rhsId] = Builder.NewBlock();
-                auto endLabel = Builder.NewLabel();
-
-                // If left is true -> end; else -> rhs
-                Builder.SetCurrentBlock(leftProducingLabel);
-                emitter.Emit0("cmp"_op, {*leftNum, endLabel, rhsLabel});
-                auto leftEdgeLabel = Builder.CurrentBlockLabel(); // predecessor into end when left was true
-
-                Builder.SetCurrentBlock(rhsId);
-                auto r = co_await Lower(binary->Right, scope);
-                if (!r.Value) co_return TError(binary->Right->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
-                emitter.Emit0("jmp"_op, {endLabel});
-                auto rightEdgeLabel = Builder.CurrentBlockLabel(); // predecessor into end when left was false
-
-                Builder.NewBlock(endLabel);
-                auto res = emitter.Emit1("phi"_op, {*leftNum, leftEdgeLabel, *r.Value, rightEdgeLabel});
-                Builder.SetType(res, FromAstType(expr->Type, Module.Types));
-                co_return TValueWithBlock{ res, Builder.CurrentBlockLabel() };
-            }
-            default:
-                {
-                    // IR '/' is type-directed: an integer destination already means
-                    // integer division, so '//' needs no IR opcode of its own.
-                    auto irOp = binary->Operator == "//"_op
-                        ? (uint64_t)'/'
-                        : (uint64_t)binary->Operator.Value;
-                    auto tmp = emitter.Emit1(irOp /* ast op to ir op mapping */, {*leftNum, *rightNum});
-                    Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
-                    co_return TValueWithBlock{ tmp, Builder.CurrentBlockLabel() };
-                }
+            // IR '/' is type-directed, so integer '//' uses the same opcode.
+            auto irOp = binary->Operator == "//"_op
+                ? '/'_op
+                : TOp(binary->Operator.Value);
+            auto tmp = emitter.Emit1(irOp, {*leftRes.Value, *rightRes.Value});
+            Builder.SetType(tmp, FromAstType(expr->Type, Module.Types));
+            co_return TValueWithBlock{tmp, Builder.CurrentBlockLabel()};
         }
+
+        const bool isAnd = binary->Operator == "&&"_op;
+        auto [rhsLabel, rhsId] = Builder.NewBlock();
+        auto endLabel = Builder.NewLabel();
+        Builder.SetCurrentBlock(leftRes.ProducingLabel);
+        emitter.Emit0("cmp"_op, {*leftRes.Value, isAnd ? rhsLabel : endLabel, isAnd ? endLabel : rhsLabel});
+        auto leftEdgeLabel = Builder.CurrentBlockLabel();
+
+        Builder.SetCurrentBlock(rhsId);
+        auto rightRes = co_await Lower(binary->Right, scope);
+        if (!rightRes.Value) {
+            co_return TError(binary->Right->Location, TErrorString::Get<EErrorId::BINARY_OPERANDS_NOT_NUMBERS>());
+        }
+        emitter.Emit0("jmp"_op, {endLabel});
+        auto rightEdgeLabel = Builder.CurrentBlockLabel();
+
+        // Nested expressions can change the RHS block; use the actual merge predecessors.
+        Builder.NewBlock(endLabel);
+        auto result = emitter.Emit1("phi"_op, {*leftRes.Value, leftEdgeLabel, *rightRes.Value, rightEdgeLabel});
+        Builder.SetType(result, FromAstType(expr->Type, Module.Types));
+        co_return TValueWithBlock{result, Builder.CurrentBlockLabel()};
     } else if (auto maybeIfExpr = NAst::TMaybeNode<NAst::TIfExpr>(expr)) {
         auto ife = maybeIfExpr.Cast();
         auto cond = co_await Lower(ife->Cond, scope);
@@ -1893,6 +1892,9 @@ TExpectedTask<TAstLowerer::TValueWithBlock, TError, TLocation> TAstLowerer::Lowe
         if (!funDecl) {
             co_return TError(call->Callee->Location, TErrorString::Get<EErrorId::NOT_A_FUNCTION>());
         }
+        if (auto op = NSemantics::VectorIntrinsic(funDecl->MangledName); !op.empty()) {
+            co_return co_await LowerVectorIntrinsic(*call, op, scope);
+        }
         auto futureResultType = NAst::FutureResultType(funDecl->RetType);
         NAst::TTypePtr returnType = futureResultType
             ? std::make_shared<NAst::TPointerType>(std::make_shared<NAst::TVoidType>())
@@ -1996,7 +1998,7 @@ void TAstLowerer::ImportExternalFunction(int symbolId, const NAst::TFunDecl& fun
     }
     // Pure inline functions have no physical implementation - skip registration
     // so backends (LLVM, WASM) don't emit imports or declarations for them.
-    if (funcDecl.InlineFactory.has_value()) {
+    if (funcDecl.InlineFactory.has_value() || !NSemantics::VectorIntrinsic(funcDecl.MangledName).empty()) {
         return;
     }
 
