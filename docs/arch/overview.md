@@ -61,15 +61,17 @@ The primary user-facing language.  Keywords are Cyrillic:
 | Param modes   | `арг` (in)  `рез`/`знач` (out)  `аргрез`   |
 | Module import | `использовать`                               |
 
-### 2.2 Core lang (internal)
+### 2.2 Core lang (oz-lang)
 
 A lower-level surface syntax for the same AST used for tests, golden files, and
 debugging.  The playground exposes it as a "core syntax" mode.  Core lang is
 useful because Kumir syntax is deliberately small and conservative: new
 constructs can be introduced, inspected, and debugged at the AST level first,
-before deciding whether they need `.kum` frontend syntax. See
-[core-lang](core-lang.md) for the concrete syntax, supported AST forms, type
-syntax, and printer conventions.
+before deciding whether they need `.kum` frontend syntax. It also supports
+source modules and computational kernels for embedding in host applications.
+The [oz-lang guide](core-lang.md) develops complete examples from basic
+expressions through structures, generics, and SIMD vectors, followed by a
+syntax reference and compiler-output conventions.
 
 ---
 

@@ -1,7 +1,9 @@
 # Struct Representation and ABI
 
-Structs are currently used mostly through named module types, most visibly the
-`компл` type from the complex-number module. At AST level a struct is
+Structures can be declared directly in oz-lang or imported as named module
+types, such as `компл` from the complex-number module. For construction, field
+access, nesting, and reference parameters, start with the
+[language guide](core-lang.md#named-types-and-structures). At AST level a struct is
 `TStructType`, optionally wrapped in `TNamedType` so user-facing diagnostics and
 printers can keep the domain name:
 
@@ -19,9 +21,14 @@ by the vector of field type ids:
 struct { f64; f64 }          ; complex number payload
 ```
 
-Struct size is the sum of field sizes in the IR type table. Field offsets are
-computed by summing sizes of all previous fields; there is no separate runtime
-header or field-name table.
+Struct layout includes alignment padding. `FieldOffset` aligns each field's
+start using `AlignInBytes`; `SizeInBytes` follows the same placement rules and
+rounds the final size to the structure's alignment. For example, an `i8`
+followed by an `i64` has field offsets 0 and 8 and occupies 16 bytes, rather
+than 9. A 128-bit integer field requires 16-byte alignment. Pointer size and
+alignment follow the module's target width, so a pointer-containing structure
+can differ between native 64-bit code and wasm32. There is no separate runtime
+header or field-name table in each value.
 
 ## In-Memory Layout
 

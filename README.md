@@ -9,7 +9,7 @@ The same compiler pipeline also exposes **core lang** (historically called **oz-
 - Language syntax: [docs/ru/syntax.md](docs/ru/syntax.md)
 - Examples: [docs/ru/examples.md](docs/ru/examples.md)
 - Compiler architecture: [docs/arch/overview.md](docs/arch/overview.md)
-- Core lang reference: [docs/arch/core-lang.md](docs/arch/core-lang.md)
+- oz-lang tutorial and reference: [docs/arch/core-lang.md](docs/arch/core-lang.md)
 
 ## Contents
 
@@ -133,7 +133,7 @@ For the component map, IR model, runtime ABI, and module system, start with [doc
 
 Core lang, also known as oz-lang after the `.oz` files in [test/regtest/cases/corelang](test/regtest/cases/corelang), is the internal surface syntax for the Qumir AST. It is useful when a host application needs a compact typed language without adopting the Russian `.kum` syntax.
 
-It supports typed and overloaded functions, generic specialization, references, managed strings, arrays, structs, and coroutines. The full grammar and type syntax are documented in [docs/arch/core-lang.md](docs/arch/core-lang.md).
+It supports typed and overloaded functions, generic specialization, references, managed strings, arrays, structs, SIMD vectors, and coroutines. The [oz-lang guide](docs/arch/core-lang.md) teaches these features through complete programs and includes a syntax reference and current implementation limits.
 
 Example:
 
@@ -223,7 +223,7 @@ On the website, a `kumir` code block inside `<qumir-example id="unique-id">` bec
 - [Examples](docs/ru/examples.md)
 - [FAQ](docs/ru/faq.md)
 - [Architecture overview](docs/arch/overview.md)
-- [Core lang reference](docs/arch/core-lang.md)
+- [oz-lang tutorial and reference](docs/arch/core-lang.md)
 - [Code style](docs/arch/codestyle.md)
 
 ## License
